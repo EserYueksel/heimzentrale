@@ -212,6 +212,14 @@ class TestHelpers(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(dest, "bitcoin-1/bin/bitcoind")))
         self.assertFalse(os.path.lexists(os.path.join(dest, "bitcoin-1/link")))
 
+    def test_get_dict_rejects_text_answers(self):
+        hub = agent.Hub("http://x", "token123")
+        hub._req = lambda method, path, body=None, timeout=20: "Not found"
+        with self.assertRaises(RuntimeError):
+            hub.get_dict("/api/agent/job?host=a")
+        hub._req = lambda method, path, body=None, timeout=20: {"job": None}
+        self.assertEqual(hub.get_dict("/api/agent/job"), {"job": None})
+
     def test_norm_and_collect(self):
         self.assertGreater(agent.norm("31.2"), agent.norm("31.1.0"))
         self.assertEqual(agent.norm("31.2"), agent.norm("31.2.0"))

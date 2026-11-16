@@ -174,6 +174,13 @@ class Hub:
     def get(self, path):
         return self._req("GET", path)
 
+    def get_dict(self, path):
+        """GET mit JSON-Objekt als Antwort - alles andere ist keine (passende) Heimzentrale."""
+        res = self._req("GET", path)
+        if not isinstance(res, dict):
+            raise RuntimeError(f"unerwartete Antwort auf {path.split('?')[0]}: {str(res)[:80]}")
+        return res
+
     def post(self, path, body):
         return self._req("POST", path, body)
 
@@ -837,7 +844,7 @@ class Agent:
         host = socket.gethostname().split(".")[0]
         self.flush_pending()
         try:
-            job = self.hub.get(f"/api/agent/job?host={host}").get("job")
+            job = self.hub.get_dict(f"/api/agent/job?host={host}").get("job")
         except Exception as e:  # noqa: BLE001
             log(f"Heimzentrale nicht erreichbar: {http_error_text(e)}")
             job = None
@@ -902,9 +909,22 @@ def main(argv):
                 print(f"{'🔒' if p['protected'] else '  '} {p['title']} ({p['type']}: {p['name']})")
             print(f"OK: {len(progs)} Programme an {CFG['HZ_URL']} gesendet")
         elif cmd == "pruefen":
-            health = agent.hub.get("/api/health")
-            job = agent.hub.get(f"/api/agent/job?host={socket.gethostname().split('.')[0]}&peek=1")
-            print(f"Heimzentrale erreichbar: {CFG['HZ_URL']} (Version {health.get('version')}), "
+            host = socket.gethostname().split(".")[0]
+            try:
+                health = agent.hub.get_dict("/api/health")
+            except Exception as e:  # noqa: BLE001
+                print(f"Heimzentrale nicht erreichbar unter {CFG['HZ_URL']}: {http_error_text(e)}", file=sys.stderr)
+                return 1
+            version = str(health.get("version", "?"))
+            try:
+                job = agent.hub.get_dict(f"/api/agent/job?host={host}&peek=1")
+            except Exception as e:  # noqa: BLE001
+                hint = " - die Heimzentrale ist zu alt, bitte zuerst dort den Installer ausführen" \
+                    if not version.startswith("2.") else ""
+                print(f"Heimzentrale {version} unter {CFG['HZ_URL']} lehnt den Agenten ab: "
+                      f"{http_error_text(e)}{hint}", file=sys.stderr)
+                return 1
+            print(f"Heimzentrale erreichbar: {CFG['HZ_URL']} (Version {version}), "
                   f"Schlüssel gültig, offener Auftrag: {'ja' if job.get('job') else 'nein'}")
         else:
             print(__doc__)

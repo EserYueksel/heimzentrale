@@ -125,6 +125,11 @@ fetch_source() { # Ordner mit app/ und install.sh
 
 conf_get() { grep -E "^$1=" "$2" 2> /dev/null | tail -n 1 | cut -d= -f2- || true; }
 
+running_version() { # Version, die gerade auf dem Port antwortet (leer = keine Antwort)
+  curl -fsS --max-time 5 "http://localhost:$PORT/api/health" 2> /dev/null \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin).get("version", ""))' 2> /dev/null || true
+}
+
 lan_ip() { # Adresse im Heimnetz: die, ueber die der Pi ins Internet geht (nicht die von Docker-Netzen)
   local a
   a=$(ip -4 route get 1.1.1.1 2> /dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
@@ -133,7 +138,7 @@ lan_ip() { # Adresse im Heimnetz: die, ueber die der Pi ins Internet geht (nicht
 }
 
 install_server() {
-  local dir src mode token ip pin pin2 topic
+  local dir src mode token ip pin pin2 topic version
   dir=$(find_install)
   say "Heimzentrale einrichten in $dir"
   src=$(fetch_source)
@@ -153,7 +158,8 @@ install_server() {
   fi
   cp -r "$src/app" "$dir/app"
   cp "$src/install.sh" "$dir/app/install.sh"
-  ok "Programm $(python3 -c "import sys; sys.path.insert(0, '$dir/app'); import hz; print(hz.VERSION)") kopiert."
+  version=$(python3 -B -c "import sys; sys.path.insert(0, '$dir/app'); import hz; print(hz.VERSION)")
+  ok "Programm $version kopiert."
 
   # Einstellungen
   local conf="$dir/data/heimzentrale.conf"
@@ -224,13 +230,20 @@ EOF
     ok "Dienst läuft (systemd: heimzentrale)."
   fi
 
-  local _
-  for _ in $(seq 1 30); do
-    curl -fsS "http://localhost:$PORT/api/health" > /dev/null 2>&1 && break
+  # Warten, bis die NEUE Version antwortet (nicht noch die alte)
+  local _ running=""
+  for _ in $(seq 1 45); do
+    running=$(running_version)
+    [ "$running" = "$version" ] && break
     sleep 1
   done
-  curl -fsS "http://localhost:$PORT/api/health" > /dev/null 2>&1 || die "Die Heimzentrale antwortet nicht auf Port $PORT."
-  ok "Antwortet auf Port $PORT."
+  [ -n "$running" ] || die "Die Heimzentrale antwortet nicht auf Port $PORT."
+  if [ "$running" != "$version" ]; then
+    [ "$mode" = docker ] && info "Neu starten mit: cd $dir && sudo docker compose restart"
+    [ "$mode" = systemd ] && info "Neu starten mit: sudo systemctl restart heimzentrale"
+    die "Auf Port $PORT läuft noch Version $running statt $version."
+  fi
+  ok "Version $version antwortet auf Port $PORT."
 
   install_agent "http://localhost:$PORT" "$token" "$dir/app/agent/heimzentrale-agent"
   desktop_shortcut
