@@ -111,17 +111,26 @@ find_install() {
 }
 
 fetch_source() { # Ordner mit app/ und install.sh
-  local here
-  here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2> /dev/null && pwd || true)
-  if [ -n "$here" ] && [ -f "$here/app/server.py" ]; then echo "$here"; return; fi
-  local tmp
+  # Aus einem geklonten Ordner gestartet: dessen Dateien nehmen. Per curl | bash: von GitHub laden.
+  local self=${BASH_SOURCE[0]:-} here="" tmp
+  if [ -n "$self" ] && [ -f "$self" ]; then
+    here=$(cd "$(dirname "$self")" && pwd)
+    if [ -f "$here/app/server.py" ]; then echo "$here"; return; fi
+  fi
   tmp=$(mktemp -d)
   curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" | tar -xz -C "$tmp" \
     || die "Herunterladen von GitHub fehlgeschlagen."
-  echo "$tmp/$(ls "$tmp" | head -n 1)"
+  find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1
 }
 
 conf_get() { grep -E "^$1=" "$2" 2> /dev/null | tail -n 1 | cut -d= -f2- || true; }
+
+lan_ip() { # Adresse im Heimnetz: die, ueber die der Pi ins Internet geht (nicht die von Docker-Netzen)
+  local a
+  a=$(ip -4 route get 1.1.1.1 2> /dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+  [ -n "$a" ] || a=$(hostname -I 2> /dev/null | tr ' ' '\n' | grep -v -E '^(172\.(1[6-9]|2[0-9]|3[01])\.|127\.)' | grep -E '^[0-9.]+$' | head -n 1)
+  echo "$a"
+}
 
 install_server() {
   local dir src mode token ip pin pin2 topic
@@ -155,7 +164,7 @@ install_server() {
     printf 'HZ_TOKEN=%s\n' "$token" >> "$conf"
     ok "Neuer Schlüssel für die Agenten erzeugt."
   fi
-  ip=$(hostname -I 2> /dev/null | awk '{print $1}')
+  ip=$(lan_ip)
   if [ -z "$(conf_get PUBLIC_URL "$conf")" ] && [ -n "$ip" ]; then
     printf 'PUBLIC_URL=http://%s:%s\n' "$ip" "$PORT" >> "$conf"
   fi
