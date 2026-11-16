@@ -1,0 +1,26 @@
+# Heimzentrale mit Docker (z. B. unter CasaOS). Der Installer passt die Pfade an.
+# Ordner auf dem Pi: /DATA/AppData/heimzentrale
+#   app/   Programm (wird bei Updates ersetzt)
+#   data/  Einstellungen und Datenbank (bleibt erhalten)
+# Starten:  cd /DATA/AppData/heimzentrale && sudo docker compose up -d
+# Seite:    http://ADRESSE-DES-PI:8088
+name: heimzentrale
+services:
+  heimzentrale:
+    image: python:3.12-alpine
+    container_name: heimzentrale
+    restart: unless-stopped
+    command: ["python", "-u", "/app/server.py"]
+    ports:
+      - "8088:8088"
+    volumes:
+      - /DATA/AppData/heimzentrale/app:/app:ro
+      - /DATA/AppData/heimzentrale/data:/data
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/api/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

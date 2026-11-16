@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""heimzentrale-agent - meldet den Zustand dieses Raspberry Pi an die Heimzentrale und fuehrt
+Auftraege aus (Bitcoin-Core-Update, Programme entfernen).
+
+Laeuft als root ueber die crontab von root, jede Minute:
+  * * * * * /usr/local/bin/heimzentrale-agent > /dev/null 2>&1
+
+Aufruf:
+  heimzentrale-agent             ein Durchlauf: Auftrag abholen, alle 5 Min. melden, stuendlich Programmliste
+  heimzentrale-agent melden      sofort melden
+  heimzentrale-agent zeigen      anzeigen, was gemeldet wuerde (sendet nichts)
+  heimzentrale-agent programme   Programmliste anzeigen und senden
+  heimzentrale-agent pruefen     Verbindung zur Heimzentrale pruefen
+  heimzentrale-agent probe VER   Bitcoin Core VER laden und pruefen, nichts installieren
+  heimzentrale-agent version
+
+Einstellungen: /etc/heimzentrale-agent.conf   HZ_URL=..., HZ_TOKEN=..., optional DISKS=/ /mnt/daten
+Protokoll:     /var/log/heimzentrale-agent.log
+Nur Python-Standardbibliothek.
+"""
+import configparser
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+AGENT_VERSION = "2.0.0"
+CONF = os.environ.get("HZ_AGENT_CONF", "/etc/heimzentrale-agent.conf")
+STATE_DIR = os.environ.get("HZ_AGENT_STATE", "/var/lib/heimzentrale-agent")
+LOG = os.environ.get("HZ_AGENT_LOG", "/var/log/heimzentrale-agent.log")
+BIN_DIR = os.environ.get("HZ_AGENT_BIN", "/usr/local/bin")
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+DEFAULTS = {
+    "HZ_URL": "",
+    "HZ_TOKEN": "",
+    "DISKS": "/",
+    "REPORT_EVERY": "300",
+    "INVENTORY_EVERY": "3600",
+    "BITCOIN_DATADIR": "/var/lib/bitcoind",
+    "CORE_BASE_URL": "https://bitcoincore.org/bin",
+    "CORE_SIGS_REPO": "https://github.com/bitcoin-core/guix.sigs",
+    "CORE_MIN_SIGS": "5",
+    # 1 = dieser Pi meldet Hitze/Drosselung/Dienstausfall schon selbst (eigenes Skript)
+    "OWN_ALARMS": "",
+}
+
+VER_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
+PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]{0,99}$")
+FLATPAK_RE = re.compile(r"^[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+){2,}$")
+
+# Pakete, die nie entfernt werden (Grundsystem, Oberflaeche, Fernzugriff, Docker/CasaOS, Heimzentrale)
+PROTECTED = [
+    "raspberrypi-*", "rpi-*", "rpd-*", "rp-*", "raspi-*", "pi-greeter", "piwiz", "agnostics",
+    "lxpanel*", "lxplug-*", "wf-panel-pi", "pcmanfm*", "libfm*", "labwc*", "wayfire*", "openbox*", "lxde*",
+    "lxsession*", "lightdm*", "xserver-xorg*", "xwayland", "lxterminal", "gnome-terminal*", "xfce4-terminal",
+    "network-manager*", "nm-*", "dhcpcd*", "wpasupplicant", "pipewire*", "wireplumber", "pulseaudio*",
+    "policykit-*", "polkitd*", "pkexec", "sudo", "openssh-*", "ssh", "systemd*", "dbus*", "udev", "apt*",
+    "dpkg", "python3", "python3.*", "python3-minimal", "libc6", "bash", "coreutils", "cron*", "curl",
+    "ca-certificates", "gnupg*", "gpg*", "git", "docker*", "containerd*", "runc", "casaos*", "zerotier*",
+    "tailscale", "flatpak", "firmware-*", "linux-image-*", "initramfs-tools*", "grub*", "u-boot*",
+]
+MAX_REMOVE = 40
+
+# ================================================================ Grundlagen
+
+def load_conf(path=CONF):
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                cfg[k.strip()] = v
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+CFG = load_conf()
+
+
+def log(msg):
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def say(msg):
+    if sys.stdout.isatty() or os.environ.get("HZ_AGENT_VERBOSE"):
+        print(msg, flush=True)
+
+
+def run(cmd, timeout=60, env=None):
+    """Befehl ausfuehren -> (rc, stdout, stderr). Fehlt das Programm: rc 127."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, **(env or {})})
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]}: nicht gefunden"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]}: Zeitlimit {timeout} s überschritten"
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+class State:
+    """Kleiner Zustand zwischen den Laeufen (letzte Meldung, CPU-Zaehler, liegengebliebene Meldungen)."""
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(STATE_DIR, "state.json")
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                self.data = json.load(f)
+        except (OSError, ValueError):
+            self.data = {}
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f)
+        os.replace(tmp, self.path)
+
+
+# ================================================================ Verbindung zur Heimzentrale
+
+class Hub:
+    def __init__(self, url, token):
+        self.url = url.rstrip("/")
+        self.token = token
+
+    def _req(self, method, path, body=None, timeout=20):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method,
+                                     headers={"X-Token": self.token, "Content-Type": "application/json",
+                                              "User-Agent": f"heimzentrale-agent/{AGENT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(4_000_000).decode("utf-8", "replace")
+        return json.loads(raw) if raw.strip().startswith(("{", "[")) else raw
+
+    def get(self, path):
+        return self._req("GET", path)
+
+    def post(self, path, body):
+        return self._req("POST", path, body)
+
+
+def http_error_text(e):
+    """Kurze, einzeilige Fehlerbeschreibung (HTML-Fehlerseiten werden weggelassen)."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            detail = " ".join(e.read(300).decode("utf-8", "replace").split())
+        except OSError:
+            detail = ""
+        if detail.startswith("<"):
+            detail = ""
+        return f"HTTP {e.code} {detail[:150]}".strip()
+    return " ".join(str(e).split())[:200]
+
+
+# ================================================================ Messwerte
+
+def cpu_times():
+    parts = read("/proc/stat").split("\n", 1)[0].split()
+    if not parts or parts[0] != "cpu":
+        return None
+    vals = [int(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+    return sum(vals[:8]), idle
+
+
+def cpu_percent(state):
+    """Auslastung seit dem letzten Lauf (hoechstens 15 Min. zurueck), sonst ueber 1 Sekunde gemessen."""
+    now_t = cpu_times()
+    if now_t is None:
+        return None
+    prev = state.get("cpu_prev") if state else None
+    if not prev or time.time() - prev[0] > 900 or now_t[0] <= prev[1]:
+        time.sleep(1)
+        prev, now_t = [time.time(), *now_t], cpu_times()
+    total, idle = now_t[0] - prev[1], now_t[1] - prev[2]
+    if state is not None:
+        state.set("cpu_prev", [time.time(), *now_t])
+    return round(max(0.0, min(100.0, (total - idle) / total * 100)), 1) if total > 0 else None
+
+
+def meminfo():
+    vals = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, rest = line.partition(":")
+        num = rest.strip().split(" ")[0]
+        if num.isdigit():
+            vals[k] = int(num) * 1024
+    total, swap_total = vals.get("MemTotal"), vals.get("SwapTotal")
+    return {"total": total, "available": vals.get("MemAvailable"), "swap_total": swap_total,
+            "swap_used": (swap_total - vals.get("SwapFree", 0)) if swap_total is not None else None}
+
+
+def mounts():
+    out = {}
+    for line in read("/proc/mounts").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def disks(paths):
+    mnt = mounts()
+    out = []
+    for p in paths:
+        try:
+            st = os.statvfs(p)
+        except OSError:
+            continue
+        out.append({"mount": p, "device": mnt.get(p), "size": st.f_blocks * st.f_frsize,
+                    "used": (st.f_blocks - st.f_bfree) * st.f_frsize, "avail": st.f_bavail * st.f_frsize})
+    return out
+
+
+def temperature():
+    rc, out, _ = run(["vcgencmd", "measure_temp"], 10)
+    m = re.search(r"temp=([0-9.]+)", out) if rc == 0 else None
+    if m:
+        return float(m.group(1))
+    raw = read("/sys/class/thermal/thermal_zone0/temp").strip()
+    return round(int(raw) / 1000, 1) if raw.isdigit() else None
+
+
+def throttled():
+    rc, out, _ = run(["vcgencmd", "get_throttled"], 10)
+    m = re.search(r"throttled=(0x[0-9a-fA-F]+)", out) if rc == 0 else None
+    if m:
+        return m.group(1)
+    raw = read("/sys/devices/platform/soc/soc:firmware/get_throttled").strip()
+    return f"0x{int(raw, 16):x}" if re.fullmatch(r"[0-9a-fA-F]+", raw or "") else None
+
+
+def default_iface():
+    for line in read("/proc/net/route").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) > 2 and parts[1] == "00000000":
+            return parts[0]
+    return None
+
+
+def net_counters():
+    iface = default_iface()
+    if not iface:
+        return None
+    rx = read(f"/sys/class/net/{iface}/statistics/rx_bytes").strip()
+    tx = read(f"/sys/class/net/{iface}/statistics/tx_bytes").strip()
+    if not (rx.isdigit() and tx.isdigit()):
+        return None
+    return {"iface": iface, "rx": int(rx), "tx": int(tx)}
+
+
+def primary_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # sendet nichts, waehlt nur die Route
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def os_name():
+    for line in read("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def docker_info():
+    if not shutil.which("docker"):
+        return None
+    rc, out, _ = run(["docker", "ps", "-a", "--format", "{{json .}}"], 30)
+    if rc != 0:
+        return {"available": False, "containers": []}
+    containers = []
+    for line in out.splitlines():
+        try:
+            c = json.loads(line)
+        except ValueError:
+            continue
+        labels = dict(x.split("=", 1) for x in str(c.get("Labels", "")).split(",") if "=" in x)
+        containers.append({"name": c.get("Names"), "image": c.get("Image"), "state": c.get("State"),
+                           "status": c.get("Status"), "project": labels.get("com.docker.compose.project")})
+    return {"available": True, "containers": containers}
+
+
+def bitcoin_cli(*args, timeout=30):
+    return run(["bitcoin-cli", f"-datadir={CFG['BITCOIN_DATADIR']}", *args], timeout)
+
+
+def bitcoin_info():
+    if not shutil.which("bitcoin-cli"):
+        return None
+    rc, out, _ = run(["systemctl", "is-active", "bitcoind"], 10)
+    service = out.strip() or "unbekannt"
+    info = {"service": service, "error": "", "blockchain": None, "network": None, "mempool": None,
+            "nettotals": None, "uptime_s": None}
+    if service != "active":
+        return info
+    for key, cmd in (("blockchain", "getblockchaininfo"), ("network", "getnetworkinfo"),
+                     ("mempool", "getmempoolinfo"), ("nettotals", "getnettotals"), ("uptime_s", "uptime")):
+        rc, out, err = bitcoin_cli(cmd)
+        if rc != 0:
+            info["error"] = info["error"] or " ".join((err or out).split())[:300]
+            if key == "blockchain":
+                break
+            continue
+        try:
+            info[key] = json.loads(out)
+        except ValueError:
+            info["error"] = info["error"] or f"{cmd}: Antwort nicht lesbar"
+    return info
+
+
+def collect(state=None):
+    mem = meminfo()
+    up = read("/proc/uptime").split()
+    load = os.getloadavg()
+    return {
+        "v": 2,
+        "agent": AGENT_VERSION,
+        "host": socket.gethostname().split(".")[0],
+        "ts": int(time.time()),
+        "device": {"model": read("/proc/device-tree/model").replace("\x00", "").strip() or None,
+                   "os": os_name(), "kernel": os.uname().release, "arch": os.uname().machine, "ip": primary_ip()},
+        "system": {
+            "cpu": {"percent": cpu_percent(state), "cores": os.cpu_count(), "load": [round(x, 2) for x in load]},
+            "mem": mem,
+            "disks": disks(CFG["DISKS"].split()),
+            "temp_c": temperature(),
+            "throttled": throttled(),
+            "uptime_s": float(up[0]) if up else None,
+            "net": net_counters(),
+        },
+        "docker": docker_info(),
+        "bitcoin": bitcoin_info(),
+        "own_alarms": CFG.get("OWN_ALARMS") == "1" or os.path.exists("/usr/local/bin/btcnode-ntfy"),
+    }
+
+
+# ================================================================ Programme
+
+def desktop_entries(dirs=("/usr/share/applications", "/usr/local/share/applications")):
+    """Programme mit Eintrag im Menue: {pfad: {title, summary}}."""
+    out = {}
+    for d in dirs:
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            cp.optionxform = str
+            try:
+                cp.read(path, encoding="utf-8")
+                e = cp["Desktop Entry"]
+            except (configparser.Error, KeyError, UnicodeDecodeError):
+                continue
+            if e.get("Type", "Application") != "Application" or e.get("NoDisplay", "").lower() == "true" \
+                    or e.get("Hidden", "").lower() == "true":
+                continue
+            title = e.get("Name[de]") or e.get("Name")
+            if title:
+                out[path] = {"title": title, "summary": e.get("Comment[de]") or e.get("Comment") or ""}
+    return out
+
+
+def dpkg_owners(paths):
+    """{pfad: paket} fuer Dateien, die zu einem Paket gehoeren."""
+    owners = {}
+    if not paths:
+        return owners
+    _rc, out, _ = run(["dpkg-query", "-S", *paths], 60)
+    for line in out.splitlines():
+        if ": " not in line:
+            continue
+        pkgs, path = line.split(": ", 1)
+        pkg = pkgs.split(",")[0].strip().split(":")[0]
+        owners[path.strip()] = pkg
+    return owners
+
+
+def dpkg_info(pkgs):
+    info = {}
+    if not pkgs:
+        return info
+    fmt = "\t".join(["${Package}", "${Version}", "${Installed-Size}", "${Priority}", "${Essential}",
+                     "${db:Status-Abbrev}", "${binary:Summary}"]) + "\n"
+    _rc, out, _ = run(["dpkg-query", "-W", "-f=" + fmt, *sorted(set(pkgs))], 60)
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        name, ver, size, prio, ess, stat, summ = parts[:7]
+        info[name.split(":")[0]] = {"version": ver, "size": int(size) * 1024 if size.isdigit() else None,
+                                    "priority": prio, "essential": ess == "yes", "installed": stat.startswith("ii"),
+                                    "summary": summ}
+    return info
+
+
+def protection(pkg, meta):
+    """Grund, warum ein Paket geschuetzt ist - oder '' wenn nicht."""
+    if meta and meta.get("essential"):
+        return "Teil des Grundsystems (essential)"
+    if meta and meta.get("priority") in ("required", "important"):
+        return "Teil des Grundsystems"
+    for pat in PROTECTED:
+        if fnmatch.fnmatch(pkg, pat):
+            return "Wird für System, Oberfläche, Fernzugriff oder Docker gebraucht"
+    return ""
+
+
+def flatpak_apps():
+    if not shutil.which("flatpak"):
+        return []
+    rc, out, _ = run(["flatpak", "list", "--app", "--columns=application,name,description,version,size"], 60)
+    apps = []
+    for line in out.splitlines() if rc == 0 else []:
+        parts = line.split("\t")
+        if len(parts) >= 2 and FLATPAK_RE.match(parts[0]):
+            apps.append({"type": "flatpak", "name": parts[0], "title": parts[1] or parts[0],
+                         "summary": parts[2] if len(parts) > 2 else "", "version": parts[3] if len(parts) > 3 else "",
+                         "size": None, "protected": False, "reason": ""})
+    return apps
+
+
+def programs():
+    entries = desktop_entries()
+    owners = dpkg_owners(list(entries))
+    by_pkg = {}
+    for path, e in entries.items():
+        pkg = owners.get(path)
+        if pkg and pkg not in by_pkg:
+            by_pkg[pkg] = e
+    meta = dpkg_info(list(by_pkg))
+    out = []
+    for pkg, e in by_pkg.items():
+        m = meta.get(pkg)
+        if not m or not m["installed"]:
+            continue
+        reason = protection(pkg, m)
+        out.append({"type": "apt", "name": pkg, "title": e["title"], "summary": e["summary"] or m["summary"],
+                    "version": m["version"], "size": m["size"], "protected": bool(reason), "reason": reason})
+    return sorted(out + flatpak_apps(), key=lambda p: p["title"].lower())
+
+
+def apt_simulate(pkg):
+    """Was wuerde 'apt-get purge --autoremove PKG' entfernen? -> (pakete, fehlertext)"""
+    rc, out, err = run(["apt-get", "-s", "-o", "Debug::NoLocking=true", "purge", "--autoremove", pkg], 120,
+                       env={"LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive"})
+    if rc != 0:
+        return None, " ".join((err or out).split())[-300:] or "apt-get meldet einen Fehler"
+    removed, other = [], []
+    for line in out.splitlines():
+        m = re.match(r"^(Purg|Remv|Inst|Conf)\s+(\S+)", line)
+        if not m:
+            continue
+        name = m.group(2).split(":")[0]
+        (removed if m.group(1) in ("Purg", "Remv") else other).append(name)
+    if other:
+        return None, "apt würde dabei auch Pakete installieren oder ändern: " + ", ".join(sorted(set(other))[:10])
+    return sorted(set(removed)), ""
+
+
+def preview(params):
+    typ, name = params.get("type"), params.get("name")
+    if typ == "flatpak":
+        if not FLATPAK_RE.match(name or ""):
+            return False, "Ungültiger Name.", None
+        return True, f"{name} wird samt seinen Daten entfernt.", {
+            "allowed": True, "packages": [name], "size": None, "blocked": [], "note": "Flatpak-Daten werden mitgelöscht."}
+    if typ != "apt" or not PKG_RE.match(name or ""):
+        return False, "Ungültiger Paketname.", None
+    removed, err = apt_simulate(name)
+    if removed is None:
+        return False, f"Vorschau nicht möglich: {err}", None
+    if name not in removed:
+        return False, f"{name} ist nicht (mehr) installiert.", None
+    meta = dpkg_info(removed)
+    blocked = [{"name": p, "reason": protection(p, meta.get(p))} for p in removed if protection(p, meta.get(p))]
+    size = sum((meta.get(p) or {}).get("size") or 0 for p in removed)
+    allowed = not blocked and len(removed) <= MAX_REMOVE
+    data = {"allowed": allowed, "packages": removed, "size": size, "blocked": blocked,
+            "details": [{"name": p, "summary": (meta.get(p) or {}).get("summary", ""),
+                         "size": (meta.get(p) or {}).get("size")} for p in removed]}
+    if blocked:
+        text = (f"Nicht sicher entfernbar: dabei würden auch geschützte Pakete entfernt "
+                f"({', '.join(b['name'] for b in blocked[:5])}).")
+    elif len(removed) > MAX_REMOVE:
+        text = f"Nicht sicher entfernbar: es würden {len(removed)} Pakete entfernt (höchstens {MAX_REMOVE})."
+    else:
+        n = len(removed)
+        text = f"{'1 Paket würde' if n == 1 else f'{n} Pakete würden'} entfernt, {max(1, round(size / 1024 ** 2))} MB werden frei."
+    return True, text, data
+
+
+def remove(params, progress):
+    typ, name, expect = params.get("type"), params.get("name"), params.get("expect") or []
+    title = params.get("title") or name
+    if typ == "flatpak":
+        if not FLATPAK_RE.match(name or ""):
+            return False, "Ungültiger Name."
+        progress("entfernen", f"Entferne {title} …")
+        rc, out, err = run(["flatpak", "uninstall", "-y", "--noninteractive", "--delete-data", name], 900)
+        if rc != 0:
+            return False, f"Entfernen fehlgeschlagen: {' '.join((err or out).split())[-300:]}"
+        run(["flatpak", "uninstall", "-y", "--noninteractive", "--unused"], 900)
+        return True, f"{title} wurde entfernt (Flatpak samt Daten)."
+    if typ != "apt" or not PKG_RE.match(name or ""):
+        return False, "Ungültiger Paketname."
+    progress("pruefen", "Prüfe, ob sich seit der Vorschau etwas geändert hat …")
+    removed, err = apt_simulate(name)
+    if removed is None:
+        return False, f"Prüfung fehlgeschlagen: {err}"
+    if sorted(removed) != sorted(expect):
+        return False, "Seit der Vorschau hat sich etwas geändert. Nichts entfernt – bitte die Vorschau neu anzeigen."
+    meta = dpkg_info(removed)
+    if any(protection(p, meta.get(p)) for p in removed):
+        return False, "Geschütztes Paket betroffen – nichts entfernt."
+    size = sum((meta.get(p) or {}).get("size") or 0 for p in removed)
+    extra = len(removed) - 1
+    progress("entfernen", f"Entferne {title} …" if not extra else
+             f"Entferne {title} und {extra} {'weiteres Paket' if extra == 1 else 'weitere Pakete'} …")
+    rc, out, err = run(["apt-get", "-y", "-o", "DPkg::Lock::Timeout=300", "purge", "--autoremove", name], 1800,
+                       env={"LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive"})
+    if rc != 0:
+        return False, f"apt-get meldet einen Fehler: {' '.join((err or out).split())[-400:]}"
+    still = [p for p, m in dpkg_info(removed).items() if m["installed"]]
+    if still:
+        return False, f"Nicht alles entfernt, noch installiert: {', '.join(still[:5])}"
+    n = len(removed)
+    return True, (f"{title} wurde entfernt ({'1 Paket' if n == 1 else f'{n} Pakete'}, {max(1, round(size / 1024 ** 2))} MB frei). "
+                  f"Persönliche Einstellungen im Benutzerordner bleiben erhalten.")
+
+
+# ================================================================ Bitcoin-Core-Update
+
+def norm(v):
+    parts = [int(x) for x in v.split(".")] + [0, 0, 0]
+    return tuple(parts[:3])
+
+
+def core_installed(path=None):
+    rc, out, _ = run([path or os.path.join(BIN_DIR, "bitcoind"), "--version"], 30)
+    m = re.search(r" v(\d+\.\d+(?:\.\d+)?)", out) if rc == 0 else None
+    return m.group(1) if m else None
+
+
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": f"heimzentrale-agent/{AGENT_VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f, 1024 * 1024)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def safe_extract(tar_path, dest):
+    """Nur normale Dateien und Ordner, nur innerhalb von dest (Verknuepfungen werden nicht gebraucht)."""
+    root = os.path.realpath(dest)
+    with tarfile.open(tar_path, "r:gz") as tf:
+        members = []
+        for m in tf.getmembers():
+            if not (m.isfile() or m.isdir()):
+                continue
+            target = os.path.realpath(os.path.join(root, m.name))
+            if target != root and not target.startswith(root + os.sep):
+                raise ValueError(f"unsicherer Pfad im Paket: {m.name}")
+            members.append(m)
+        try:
+            tf.extractall(root, members=members, filter="data")
+        except TypeError:  # Python ohne filter-Parameter
+            tf.extractall(root, members=members)
+
+
+def verify_signatures(sums, asc, progress):
+    gnupg = os.path.join(STATE_DIR, "gnupg")
+    os.makedirs(gnupg, mode=0o700, exist_ok=True)
+    os.chmod(gnupg, 0o700)
+    repo = os.path.join(STATE_DIR, "guix.sigs")
+    if os.path.isdir(os.path.join(repo, ".git")):
+        ok = run(["git", "-C", repo, "fetch", "-q", "--depth", "1", "--filter=blob:none", "origin"], 300)[0] == 0 \
+            and run(["git", "-C", repo, "reset", "-q", "--hard", "FETCH_HEAD"], 120)[0] == 0
+    else:
+        shutil.rmtree(repo, ignore_errors=True)
+        ok = run(["git", "clone", "-q", "--depth", "1", "--filter=blob:none", "--sparse", CFG["CORE_SIGS_REPO"], repo], 600)[0] == 0 \
+            and run(["git", "-C", repo, "sparse-checkout", "set", "builder-keys"], 300)[0] == 0
+    if not ok:
+        return False, "Die Schlüsselliste der Entwickler (guix.sigs) ließ sich nicht laden."
+    keys = glob.glob(os.path.join(repo, "builder-keys", "*.gpg"))
+    run(["gpg", "--batch", "--quiet", "--import", *keys], 300, env={"GNUPGHOME": gnupg})
+    _rc, out, _ = run(["gpg", "--batch", "--status-fd", "1", "--verify", asc, sums], 120, env={"GNUPGHOME": gnupg})
+    good = re.findall(r"^\[GNUPG:\] GOODSIG [0-9A-F]+ (.*)$", out, re.M)
+    bad = re.findall(r"^\[GNUPG:\] BADSIG ", out, re.M)
+    names = ", ".join(n.split(" <")[0] for n in good[:6])
+    if bad:
+        return False, f"{len(bad)} UNGÜLTIGE Signatur(en) – Abbruch, nichts installiert."
+    need = int(CFG["CORE_MIN_SIGS"])
+    if len(good) < need:
+        return False, f"Nur {len(good)} gültige Signaturen (mindestens {need} nötig) – Abbruch, nichts installiert."
+    progress("signaturen", f"{len(good)} gültige Signaturen, keine ungültige (u. a. {names}).")
+    return True, ""
+
+
+def fetch_and_verify(ver, progress):
+    """Laden und pruefen. Aendert nichts am Node. -> (ok, text, bin_dir)"""
+    work = os.path.join(STATE_DIR, "dl", ver)
+    free = shutil.disk_usage(STATE_DIR).free // 1024 ** 2
+    if free < 600:
+        return False, f"Zu wenig Platz: nur {free} MB frei, gebraucht werden 600 MB.", None
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    triplet = {"aarch64": "aarch64-linux-gnu", "armv7l": "arm-linux-gnueabihf",
+               "x86_64": "x86_64-linux-gnu"}.get(os.uname().machine, f"{os.uname().machine}-linux-gnu")
+    tarball = f"bitcoin-{ver}-{triplet}.tar.gz"
+    progress("laden", f"Lade Bitcoin Core {ver} von bitcoincore.org …")
+    try:
+        for name in (tarball, "SHA256SUMS", "SHA256SUMS.asc"):
+            download(f"{CFG['CORE_BASE_URL']}/bitcoin-core-{ver}/{name}", os.path.join(work, name))
+    except (urllib.error.URLError, OSError) as e:
+        return False, f"Download fehlgeschlagen ({http_error_text(e)}). Gibt es {ver} schon auf bitcoincore.org?", None
+    want = None
+    for line in read(os.path.join(work, "SHA256SUMS")).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == tarball:
+            want = parts[0].lower()
+    if not want or sha256_file(os.path.join(work, tarball)) != want:
+        return False, "Prüfsumme stimmt NICHT – Abbruch, nichts installiert.", None
+    progress("pruefsumme", "Prüfsumme OK.")
+    progress("signaturen", "Prüfe die Signaturen der Entwickler …")
+    ok, text = verify_signatures(os.path.join(work, "SHA256SUMS"), os.path.join(work, "SHA256SUMS.asc"), progress)
+    if not ok:
+        return False, text, None
+    try:
+        safe_extract(os.path.join(work, tarball), work)
+    except (tarfile.TarError, ValueError, OSError) as e:
+        return False, f"Entpacken fehlgeschlagen: {e}", None
+    bindir = os.path.join(work, f"bitcoin-{ver}", "bin")
+    got = core_installed(os.path.join(bindir, "bitcoind"))
+    if not got or norm(got) != norm(ver):
+        return False, f"Das Paket meldet Version '{got}' statt {ver}.", None
+    progress("entpacken", f"Entpackt, das Programm meldet Version {got}.")
+    return True, "", bindir
+
+
+def install_binaries(src_bitcoind, src_cli):
+    for src, name in ((src_bitcoind, "bitcoind"), (src_cli, "bitcoin-cli")):
+        dst = os.path.join(BIN_DIR, name)
+        tmp = dst + ".neu"
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o755)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, dst)
+
+
+def wait_node(want, heartbeat, tries=45, pause=20):
+    for _ in range(tries):
+        state = run(["systemctl", "is-active", "bitcoind"], 10)[1].strip()
+        if state not in ("active", "activating"):
+            return False
+        rc, out, _ = bitcoin_cli("getnetworkinfo")
+        if rc == 0:
+            m = re.search(r"Satoshi:(\d+\.\d+(?:\.\d+)?)", out)
+            if m and norm(m.group(1)) == norm(want):
+                return True
+        heartbeat()
+        time.sleep(pause)
+    return False
+
+
+def core_update(params, progress, heartbeat):
+    ver = params.get("version", "")
+    if not VER_RE.match(ver):
+        return False, "Ungültige Versionsangabe."
+    cur = core_installed()
+    if not cur:
+        return False, "Installierte Version nicht lesbar (bitcoind --version)."
+    if norm(ver) <= norm(cur):
+        return False, f"{ver} ist nicht neuer als die installierte Version {cur} – nichts zu tun."
+    progress("start", f"Update von {cur} auf {ver} beginnt.")
+    ok, text, bindir = fetch_and_verify(ver, progress)
+    if not ok:
+        return False, text
+    backup = os.path.join(STATE_DIR, "backup")
+    os.makedirs(backup, exist_ok=True)
+    old_d, old_c = os.path.join(backup, f"bitcoind-{cur}"), os.path.join(backup, f"bitcoin-cli-{cur}")
+    try:
+        shutil.copy2(os.path.join(BIN_DIR, "bitcoind"), old_d)
+        shutil.copy2(os.path.join(BIN_DIR, "bitcoin-cli"), old_c)
+    except OSError as e:
+        return False, f"Sicherung der alten Version fehlgeschlagen ({e}) – nichts geändert."
+    progress("sicherung", f"Alte Version {cur} gesichert.")
+    progress("stoppen", "Stoppe den Node (kann einige Minuten dauern) …")
+    run(["systemctl", "stop", "bitcoind"], 900)
+    if run(["systemctl", "is-active", "bitcoind"], 10)[1].strip() == "active":
+        return False, "Der Node ließ sich nicht stoppen – nichts geändert, er läuft weiter."
+    try:
+        install_binaries(os.path.join(bindir, "bitcoind"), os.path.join(bindir, "bitcoin-cli"))
+    except OSError as e:
+        install_binaries(old_d, old_c)
+        run(["systemctl", "start", "bitcoind"], 1800)
+        return False, f"Installieren fehlgeschlagen ({e}) – alte Version {cur} wieder gestartet."
+    progress("installieren", f"Bitcoin Core {ver} installiert. Starte den Node …")
+    run(["systemctl", "start", "bitcoind"], 1800)
+    if wait_node(ver, heartbeat):
+        blocks = bitcoin_cli("getblockcount")[1].strip() or "?"
+        peers = bitcoin_cli("getconnectioncount")[1].strip() or "?"
+        shutil.rmtree(os.path.join(STATE_DIR, "dl", ver), ignore_errors=True)
+        return True, f"Bitcoin Core {ver} läuft (vorher {cur}). Block {blocks}, Verbindungen {peers}."
+    progress("zurueck", f"Neue Version startet nicht richtig – spiele {cur} zurück …")
+    run(["systemctl", "stop", "bitcoind"], 900)
+    install_binaries(old_d, old_c)
+    run(["systemctl", "start", "bitcoind"], 1800)
+    if wait_node(cur, heartbeat):
+        return False, f"Update auf {ver} fehlgeschlagen. Die alte Version {cur} läuft wieder."
+    return False, (f"ACHTUNG: Auch die alte Version {cur} läuft nicht. Nachsehen: systemctl status bitcoind "
+                   f"und sudo tail -n 40 {CFG['BITCOIN_DATADIR']}/debug.log")
+
+
+# ================================================================ Ablauf
+
+class Agent:
+    def __init__(self, hub, state):
+        self.hub, self.state = hub, state
+
+    def send_report(self):
+        payload = collect(self.state)
+        self.hub.post("/api/report", payload)
+        self.state.set("last_report", time.time())
+        return payload
+
+    def send_inventory(self):
+        progs = programs()
+        self.hub.post("/api/agent/inventory", {"host": socket.gethostname().split(".")[0], "programs": progs})
+        self.state.set("last_inventory", time.time())
+        self.state.set("inventory_dirty", False)
+        return progs
+
+    def heartbeat(self):
+        """Waehrend langer Auftraege weiter alle 5 Minuten melden."""
+        if time.time() - self.state.get("last_report", 0) >= float(CFG["REPORT_EVERY"]):
+            try:
+                self.send_report()
+            except Exception as e:  # noqa: BLE001
+                log(f"Meldung fehlgeschlagen: {http_error_text(e)}")
+
+    def post_progress(self, body):
+        try:
+            self.hub.post("/api/agent/progress", body)
+        except Exception as e:  # noqa: BLE001
+            log(f"Fortschritt nicht gesendet: {http_error_text(e)}")
+            if body["state"] in ("done", "failed"):
+                pending = self.state.get("pending", [])
+                pending.append(body)
+                self.state.set("pending", pending[-10:])
+
+    def flush_pending(self):
+        pending, keep = self.state.get("pending", []), []
+        for body in pending:
+            try:
+                self.hub.post("/api/agent/progress", body)
+            except Exception:  # noqa: BLE001
+                keep.append(body)
+        self.state.set("pending", keep)
+
+    def run_job(self, job):
+        jid, kind, params = job["id"], job["kind"], job.get("params") or {}
+        log(f"Auftrag {jid}: {kind} {json.dumps(params, ensure_ascii=False)[:200]}")
+
+        def progress(step, text):
+            log(f"[{jid}] {step}: {text}")
+            say(f"[{step}] {text}")
+            self.post_progress({"job": jid, "state": "running", "step": step, "text": text})
+
+        data = None
+        try:
+            if kind == "core-update":
+                ok, text = core_update(params, progress, self.heartbeat)
+                self.state.set("last_report", 0)  # gleich neue Version melden
+            elif kind == "app-preview":
+                progress("vorschau", "Berechne, was entfernt würde …")
+                ok, text, data = preview(params)
+            elif kind == "app-remove":
+                ok, text = remove(params, progress)
+                self.state.set("inventory_dirty", True)
+                self.state.set("last_report", 0)
+            else:
+                ok, text = False, f"Unbekannte Auftragsart: {kind}"
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, f"Unerwarteter Fehler: {e}"
+            log(f"[{jid}] Fehler: {e!r}")
+        log(f"[{jid}] {'fertig' if ok else 'gescheitert'}: {text}")
+        say(text)
+        self.post_progress({"job": jid, "state": "done" if ok else "failed", "step": "ende", "text": text,
+                            "data": data})
+
+    def tick(self):
+        host = socket.gethostname().split(".")[0]
+        self.flush_pending()
+        try:
+            job = self.hub.get(f"/api/agent/job?host={host}").get("job")
+        except Exception as e:  # noqa: BLE001
+            log(f"Heimzentrale nicht erreichbar: {http_error_text(e)}")
+            job = None
+        if job:
+            self.run_job(job)
+        now = time.time()
+        if now - self.state.get("last_report", 0) >= float(CFG["REPORT_EVERY"]) - 15:
+            try:
+                self.send_report()
+            except Exception as e:  # noqa: BLE001
+                log(f"Meldung fehlgeschlagen: {http_error_text(e)}")
+        if self.state.get("inventory_dirty") or now - self.state.get("last_inventory", 0) >= float(CFG["INVENTORY_EVERY"]):
+            try:
+                self.send_inventory()
+            except Exception as e:  # noqa: BLE001
+                log(f"Programmliste nicht gesendet: {http_error_text(e)}")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "durchlauf"
+    if cmd == "version":
+        print(AGENT_VERSION)
+        return 0
+    if cmd == "zeigen":
+        print(json.dumps(collect(None), indent=2, ensure_ascii=False))
+        return 0
+    if os.geteuid() != 0:
+        print("Bitte mit sudo starten.", file=sys.stderr)
+        return 1
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "lock"), "w")  # noqa: SIM115 - bleibt bis zum Ende offen
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Der Agent läuft gerade schon (z. B. ein Update).", file=sys.stderr)
+        return 0
+    state = State()
+    try:
+        if cmd == "probe":
+            ver = argv[2] if len(argv) > 2 else ""
+            if not VER_RE.match(ver):
+                print("Aufruf: sudo heimzentrale-agent probe VERSION   (z. B. 31.2)", file=sys.stderr)
+                return 2
+            ok, text, bindir = fetch_and_verify(ver, lambda step, t: print(f"[{step}] {t}", flush=True))
+            if bindir:
+                shutil.rmtree(os.path.join(STATE_DIR, "dl", ver), ignore_errors=True)
+            print(f"Probelauf OK: Bitcoin Core {ver} ist geladen und geprüft. Installiert wurde nichts."
+                  if ok else f"Probelauf gescheitert: {text}")
+            return 0 if ok else 1
+        if not CFG["HZ_URL"]:
+            print(f"HZ_URL fehlt in {CONF}", file=sys.stderr)
+            return 1
+        agent = Agent(Hub(CFG["HZ_URL"], CFG["HZ_TOKEN"]), state)
+        if cmd == "durchlauf":
+            agent.tick()
+        elif cmd == "melden":
+            agent.send_report()
+            print(f"OK: an {CFG['HZ_URL']} gemeldet")
+        elif cmd == "programme":
+            progs = agent.send_inventory()
+            for p in progs:
+                print(f"{'🔒' if p['protected'] else '  '} {p['title']} ({p['type']}: {p['name']})")
+            print(f"OK: {len(progs)} Programme an {CFG['HZ_URL']} gesendet")
+        elif cmd == "pruefen":
+            health = agent.hub.get("/api/health")
+            job = agent.hub.get(f"/api/agent/job?host={socket.gethostname().split('.')[0]}&peek=1")
+            print(f"Heimzentrale erreichbar: {CFG['HZ_URL']} (Version {health.get('version')}), "
+                  f"Schlüssel gültig, offener Auftrag: {'ja' if job.get('job') else 'nein'}")
+        else:
+            print(__doc__)
+            return 2
+        return 0
+    except urllib.error.HTTPError as e:
+        print(f"Fehler von der Heimzentrale: {http_error_text(e)}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        print(f"Heimzentrale nicht erreichbar ({CFG['HZ_URL']}): {e}", file=sys.stderr)
+        return 1
+    finally:
+        state.save()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

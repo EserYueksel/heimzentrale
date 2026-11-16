@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+app.vorher/
+# wird vom Installer aus install.sh kopiert
+app/install.sh

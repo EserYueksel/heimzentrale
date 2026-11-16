@@ -1,0 +1,11 @@
+{
+  "name": "Heimzentrale",
+  "short_name": "Heimzentrale",
+  "description": "Zustand und Pflege der Raspberry Pis im Haus",
+  "lang": "de",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#e9ecea",
+  "theme_color": "#14201d",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
