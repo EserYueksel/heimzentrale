@@ -45,7 +45,7 @@ remove_old_melder() {
     [ -f "$f" ] || continue
     u=$(basename "$f")
     if crontab -u "$u" -l 2> /dev/null | grep -q heimzentrale-melder; then
-      crontab -u "$u" -l | grep -v heimzentrale-melder | crontab -u "$u" -
+      { crontab -u "$u" -l | grep -v heimzentrale-melder || true; } | crontab -u "$u" -
       ok "Alten Melder aus der crontab von $u entfernt (der Agent übernimmt)."
     fi
   done
