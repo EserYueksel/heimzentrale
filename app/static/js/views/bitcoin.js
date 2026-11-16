@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { el, lamp } from '../dom.js';
 import { ago, bytes, dec2, duration, int, now } from '../format.js';
-import { isActive, taskView } from './tasks.js';
+import { hideResult, isActive, showResult, taskResult, taskView } from './tasks.js';
 
 function figure(label, value, unit, lines) {
   return el('div', { class: 'figure' },
@@ -40,9 +40,11 @@ export function coreBlock(box, d, ui, ctx) {
   const core = d.core;
   const kids = [];
   const task = d.task && d.task.kind === 'core-update' ? d.task : null;
-  if (task && (isActive(task) || now() - task.updated < 6 * 3600)) {
-    kids.push(taskView(task, { title: `Update ${task.params.from || ''} → ${task.params.version}`,
-      onCancel: async () => { await api.cancel(d.host).catch(() => null); ctx.refresh(); } }));
+  const title = task ? `Update ${task.params.from ? `${task.params.from} → ` : 'auf '}${task.params.version}` : '';
+  if (isActive(task)) {
+    kids.push(taskView(task, { title, onCancel: async () => { await api.cancel(d.host).catch(() => null); ctx.refresh(); } }));
+  } else if (showResult(task)) {
+    kids.push(taskResult(task, { title, onHide: () => { hideResult(task.id); ctx.render(); } }));
   }
   if (!isActive(task)) {
     if (core.offers.length) {

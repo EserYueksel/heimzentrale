@@ -72,7 +72,8 @@ def build(now=None):
             "findings": [{"level": f["level"], "title": f["title"], "text": f["text"], "notify": f["notify"],
                           "notified": notified.get(f["key"], 0) > 0} for f in s["findings"]],
             "core": core.summary(m) if m.get("has_bitcoin") else None,
-            "task": tasks.public(tasks.active(host) or tasks.recent(host, now - 86400)),
+            # letzter Auftrag der Woche - wie lange das Ergebnis sichtbar bleibt, entscheidet die Seite
+            "task": tasks.public(tasks.active(host) or tasks.recent(host, now - 7 * 86400)),
             "inventory": inv.get(host),
         })
     return {
